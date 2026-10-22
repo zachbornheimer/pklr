@@ -44,6 +44,15 @@ pub(super) fn module_props_insert(
     Arc::make_mut(properties).insert(key.into(), value);
 }
 
+/// Whether setting `name` to `value` changes the module scope: the scope binds
+/// `name` itself to something not known to hold the same data.
+pub(super) fn replaces_value(scope: &Scope, name: &str, value: &Value) -> bool {
+    !scope
+        .vars
+        .get(name)
+        .is_some_and(|current| current.same_data(value))
+}
+
 pub(super) fn props_insert(
     scope: &mut Scope,
     aliases: &[Name],
