@@ -795,6 +795,127 @@ impl PartialEq for Regex {
     }
 }
 
+/// How an object's [`ObjectSource`] changes what it is, as opposed to what it
+/// holds: its kind and class. `None` is a plain `Dynamic`.
+fn object_shape(source: Option<&ObjectSource>) -> (ObjectKind, Option<&str>, Option<&str>) {
+    source.map_or((ObjectKind::Object, None, None), |source| {
+        (
+            source.kind,
+            source.type_identity.as_deref(),
+            source.type_name.as_deref(),
+        )
+    })
+}
+
+/// How deeply `same_data` follows nested values. Each level takes a stack
+/// frame, so a value nested deeper is treated as not known to be equal.
+const SAME_DATA_MAX_DEPTH: usize = 512;
+
+/// Objects, lists and captured scopes already found equal, by address, and
+/// whether their lambdas were compared by body only (`nested`).
+type EqualPairs = HashSet<(usize, usize, bool)>;
+
+/// Whether two shared maps hold the same members in the same order.
+fn same_members(
+    a: &Arc<ObjectMap>,
+    b: &Arc<ObjectMap>,
+    equal: &mut EqualPairs,
+    nested: bool,
+    depth: usize,
+) -> bool {
+    let pair = (Arc::as_ptr(a) as usize, Arc::as_ptr(b) as usize, nested);
+    if pair.0 == pair.1 || equal.contains(&pair) {
+        return true;
+    }
+    let same = a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|((a_key, a), (b_key, b))| {
+            a_key == b_key && same_data(a, b, equal, nested, depth + 1)
+        });
+    if same {
+        equal.insert(pair);
+    }
+    same
+}
+
+/// [`Value::same_data`] for values `depth` levels into the comparison. `nested`
+/// is set inside a lambda's capture, where lambdas are not compared by what
+/// they captured.
+fn same_data(a: &Value, b: &Value, equal: &mut EqualPairs, nested: bool, depth: usize) -> bool {
+    if depth > SAME_DATA_MAX_DEPTH {
+        return false;
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        // Bits, not `==`: `0.0` and `-0.0` render differently, and a NaN is
+        // the same value as another with the same bits.
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Object(a, a_source), Value::Object(b, b_source)) => {
+            object_shape(a_source.as_deref()) == object_shape(b_source.as_deref())
+                && same_members(a, b, equal, nested, depth)
+        }
+        (Value::List(a), Value::List(b)) => {
+            if a.kind() != b.kind() {
+                return false;
+            }
+            let pair = (a.items_ptr() as usize, b.items_ptr() as usize, nested);
+            if pair.0 == pair.1 || equal.contains(&pair) {
+                return true;
+            }
+            let same = a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| same_data(a, b, equal, nested, depth + 1));
+            if same {
+                equal.insert(pair);
+            }
+            same
+        }
+        // Every evaluation of a lambda expression makes a new lambda with a
+        // new capture, so equal lambdas are told apart by what they hold: the
+        // parameters, the body and the captured data. A capture holds the
+        // lambda's own previous version (through `this`), and that one holds
+        // the version before it, so lambdas inside a capture are compared by
+        // parameters and body only. What such a lambda captured is a copy of
+        // members the caller compares directly; it can lag behind them, which
+        // is what late binding allows for (see `forward_reference_chain`).
+        (Value::Lambda(a_params, a_body, a_env), Value::Lambda(b_params, b_body, b_env)) => {
+            a_params == b_params
+                && (Arc::ptr_eq(a_body, b_body) || a_body == b_body)
+                && (nested || same_members(a_env, b_env, equal, true, depth))
+        }
+        (Value::Regex(a), Value::Regex(b)) => a == b,
+        (Value::Duration(a), Value::Duration(b)) => {
+            a.unit == b.unit && a.value.to_bits() == b.value.to_bits()
+        }
+        (Value::DataSize(a), Value::DataSize(b)) => {
+            a.unit == b.unit && a.value.to_bits() == b.value.to_bits()
+        }
+        _ => false,
+    }
+}
+
+impl Value {
+    /// Whether `other` holds the same data as `self`: the same members, items
+    /// and scalars in the same order, objects of the same kind and class, and
+    /// lambdas with the same parameters, body and captured data.
+    ///
+    /// This is not `==`. An object's [`ObjectSource`] holds the scopes it was
+    /// defined in, which share structure with the objects they contain, so
+    /// comparing them is exponential in how deeply objects nest. Here only
+    /// what the object holds is compared, and a pair of shared objects or
+    /// lists is not compared twice.
+    ///
+    /// `false` means "not known to be equal", not "different": a value nested
+    /// more than `SAME_DATA_MAX_DEPTH` levels deep is not followed, so the
+    /// comparison cannot overflow the stack.
+    pub(crate) fn same_data(&self, other: &Value) -> bool {
+        same_data(self, other, &mut EqualPairs::default(), false, 0)
+    }
+}
+
 impl Value {
     /// The pkl class name of this value's type, as pkl reports it in errors.
     pub fn type_name(&self) -> &'static str {
@@ -998,5 +1119,173 @@ impl From<serde_json::Value> for Value {
                 Value::Object(Arc::new(map), None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod same_data_tests {
+    use super::*;
+
+    fn object(members: Vec<(&str, Value)>) -> Value {
+        let map: ObjectMap = members.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        Value::Object(Arc::new(map), None)
+    }
+
+    fn lambda(env: Vec<(&str, Value)>) -> Value {
+        let env: ScopeMap = env.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        Value::Lambda(
+            Arc::from(vec!["x".to_string()]),
+            Arc::new(Expr::Ident("x".into())),
+            Arc::new(env),
+        )
+    }
+
+    #[test]
+    fn floats_are_the_same_only_when_their_bits_are() {
+        assert!(Value::Float(1.5).same_data(&Value::Float(1.5)));
+        assert!(Value::Float(f64::NAN).same_data(&Value::Float(f64::NAN)));
+        assert!(!Value::Float(0.0).same_data(&Value::Float(-0.0)));
+        assert!(!Value::Int(1).same_data(&Value::Float(1.0)));
+    }
+
+    #[test]
+    fn collections_of_different_kinds_are_not_the_same() {
+        let items = vec![Value::Int(1), Value::Int(2)];
+        let list = |kind| Value::List(ListValue::new(kind, items.clone()));
+        assert!(list(ListKind::List).same_data(&list(ListKind::List)));
+        assert!(!list(ListKind::List).same_data(&list(ListKind::Set)));
+        assert!(!list(ListKind::List).same_data(&list(ListKind::Listing)));
+    }
+
+    #[test]
+    fn objects_are_the_same_with_the_same_members_in_the_same_order() {
+        let a = object(vec![("x", Value::Int(1)), ("y", Value::Int(2))]);
+        assert!(a.same_data(&object(vec![("x", Value::Int(1)), ("y", Value::Int(2))])));
+        assert!(!a.same_data(&object(vec![("y", Value::Int(2)), ("x", Value::Int(1))])));
+        assert!(!a.same_data(&object(vec![("x", Value::Int(1)), ("y", Value::Int(3))])));
+        assert!(!a.same_data(&object(vec![("x", Value::Int(1))])));
+    }
+
+    /// Each level holds the one below it twice, so comparing the levels as a
+    /// tree takes time exponential in how many there are.
+    #[test]
+    fn deeply_shared_objects_compare_in_linear_time() {
+        fn tower(levels: usize) -> Value {
+            let mut value = Value::Int(0);
+            for _ in 0..levels {
+                value = object(vec![("left", value.clone()), ("right", value)]);
+            }
+            value
+        }
+
+        assert!(tower(64).same_data(&tower(64)));
+        let mut other = tower(63);
+        other = object(vec![("left", other.clone()), ("right", other)]);
+        assert!(tower(64).same_data(&other));
+        assert!(!tower(64).same_data(&tower(63)));
+    }
+
+    #[test]
+    fn lambdas_are_the_same_with_the_same_body_and_captured_data() {
+        let a = lambda(vec![("n", Value::Int(1))]);
+        assert!(a.same_data(&lambda(vec![("n", Value::Int(1))])));
+        assert!(!a.same_data(&lambda(vec![("n", Value::Int(2))])));
+        assert!(!a.same_data(&lambda(vec![])));
+    }
+
+    /// A lambda captures its previous version, which captured the one before.
+    /// Comparing those in full never ends in two versions being equal.
+    #[test]
+    fn lambdas_captured_by_a_lambda_compare_by_body_only() {
+        let old = lambda(vec![("n", Value::Int(1))]);
+        let new = lambda(vec![("n", Value::Int(2))]);
+        assert!(!old.same_data(&new));
+        assert!(lambda(vec![("self", old)]).same_data(&lambda(vec![("self", new)])));
+    }
+
+    /// A value nested too deeply to follow is not known to be the same, which
+    /// is what a caller must assume of any value it cannot compare.
+    #[test]
+    fn values_nested_beyond_the_depth_limit_are_not_known_to_be_the_same() {
+        fn nested(levels: usize) -> Value {
+            let mut value = Value::Int(0);
+            for _ in 0..levels {
+                value = Value::List(ListValue::new(ListKind::List, vec![value]));
+            }
+            value
+        }
+        assert!(nested(SAME_DATA_MAX_DEPTH / 2).same_data(&nested(SAME_DATA_MAX_DEPTH / 2)));
+        assert!(nested(SAME_DATA_MAX_DEPTH).same_data(&nested(SAME_DATA_MAX_DEPTH)));
+        assert!(!nested(SAME_DATA_MAX_DEPTH + 1).same_data(&nested(SAME_DATA_MAX_DEPTH + 1)));
+
+        // Far deeper than a test thread's stack could follow. The values are
+        // leaked because dropping them recurses just as deep.
+        let (a, b) = (nested(100_000), nested(100_000));
+        assert!(!a.same_data(&b));
+        std::mem::forget((a, b));
+    }
+
+    fn lambda_over(body: &Arc<Expr>, env: Vec<(&str, Value)>) -> Value {
+        let env: ScopeMap = env.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        Value::Lambda(
+            Arc::from(vec!["x".to_string()]),
+            Arc::clone(body),
+            Arc::new(env),
+        )
+    }
+
+    /// Two evaluations of one lambda expression share its body, so what tells
+    /// them apart is what each captured.
+    #[test]
+    fn lambdas_sharing_a_body_differ_in_what_they_captured() {
+        let body = Arc::new(Expr::Ident("x".into()));
+        let a = lambda_over(&body, vec![("n", Value::Int(1))]);
+        assert!(a.same_data(&lambda_over(&body, vec![("n", Value::Int(1))])));
+        assert!(!a.same_data(&lambda_over(&body, vec![("n", Value::Int(2))])));
+    }
+
+    #[test]
+    fn objects_and_lists_with_other_keys_or_lengths_are_not_the_same() {
+        let one = |key| object(vec![(key, Value::Int(1))]);
+        assert!(one("x").same_data(&one("x")));
+        assert!(!one("x").same_data(&one("y")));
+
+        let list = |items: Vec<Value>| Value::List(ListValue::new(ListKind::List, items));
+        let two = list(vec![Value::Int(1), Value::Int(2)]);
+        assert!(two.same_data(&list(vec![Value::Int(1), Value::Int(2)])));
+        assert!(!two.same_data(&list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])));
+        assert!(!list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]).same_data(&two));
+    }
+
+    /// `a` captures `shared`, so `shared` is first compared inside a capture,
+    /// where the lambda in it only has to have the same body. Compared again
+    /// as a member of its own, the lambda must also have captured the same.
+    #[test]
+    fn a_pair_found_equal_inside_a_capture_is_compared_again_outside_it() {
+        let body = Arc::new(Expr::Ident("x".into()));
+        let object_holding = |n: i64| {
+            let shared = object(vec![("f", lambda_over(&body, vec![("n", Value::Int(n))]))]);
+            let capturing = lambda_over(&body, vec![("shared", shared.clone())]);
+            object(vec![("a", capturing), ("b", shared)])
+        };
+        assert!(object_holding(1).same_data(&object_holding(1)));
+        assert!(!object_holding(1).same_data(&object_holding(2)));
+    }
+
+    /// Objects with the same members are not the same when one is a `Mapping`
+    /// or an instance of a class and the other a `Dynamic`.
+    #[cfg(feature = "native-io")]
+    #[test]
+    fn objects_of_other_kinds_are_not_the_same_with_the_same_members() {
+        let source = "class C { k = 1 }\nd = new Dynamic { k = 1 }\nd2 = new Dynamic { k = 1 }\nm = new Mapping { [\"k\"] = 1 }\nc = new C {}\n";
+        let module = crate::eval::Evaluator::new()
+            .eval_source(source, std::path::Path::new("kinds.pkl"))
+            .unwrap();
+        let Value::Object(members, _) = &module else {
+            panic!("expected an object");
+        };
+        assert!(members["d"].same_data(&members["d2"]));
+        assert!(!members["d"].same_data(&members["m"]));
+        assert!(!members["d"].same_data(&members["c"]));
     }
 }
