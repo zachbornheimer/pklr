@@ -123,6 +123,9 @@ pub struct Evaluator {
     #[cfg(test)]
     /// Total entries visited by guard-registry cleanup, for amortization tests.
     lambda_guard_prune_scans: usize,
+    #[cfg(test)]
+    /// Late-binding passes run, for convergence tests.
+    late_passes_run: usize,
     /// Resources read in this run, by URI. As in Pkl, reading a resource again
     /// returns the first result, so reads are deterministic.
     resource_cache: HashMap<String, Value>,
@@ -824,6 +827,8 @@ impl Evaluator {
             lambda_guard_prune_at: LAMBDA_GUARD_PRUNE_MIN,
             #[cfg(test)]
             lambda_guard_prune_scans: 0,
+            #[cfg(test)]
+            late_passes_run: 0,
             resource_cache: HashMap::default(),
             allowed_resources: DEFAULT_ALLOWED_RESOURCES
                 .iter()
@@ -3107,7 +3112,46 @@ impl Evaluator {
         } else {
             HashSet::default()
         };
-        for pass in 0..=late_passes {
+        // A pass evaluates the properties of `late_order` in turn. It reads one
+        // listed before the reader as this pass has just evaluated it, and one
+        // listed after it as the previous pass left it. An object or lambda
+        // keeps the scope it was made in, so a change reaches a property that
+        // reads it through such a capture one pass later for every forward
+        // reference on the way, and no value changes while it travels. A pass
+        // that changes nothing is therefore not necessarily the last. The
+        // passes stop once more of them in a row than that longest chain of
+        // forward references (`forward_reference_chain`) have changed nothing,
+        // or at `late_passes`, which is what they ran to before. A value
+        // `same_data` cannot show equal keeps them running to that bound.
+        //
+        // This assumes the reference analysis misses no read: a property it
+        // does not see reading another can stop the passes before a change
+        // reaches it. It counts a read of `this`, `module` or a computed key
+        // as a read of every property.
+        //
+        // Pass 0 never counts as unchanged: it starts from the values the base
+        // module computed.
+        let late_order: Vec<&Property> = late_inherited_properties
+            .iter()
+            .map(|prop| &**prop)
+            .filter(|prop| {
+                !child_property_names.contains(prop.name.as_ref())
+                    && !reads_super.contains(prop.name.as_ref())
+            })
+            .chain(late_child_properties.iter().copied())
+            .collect();
+        let settled_after = forward_reference_chain(&late_order) + 2;
+        let mut pass = 0;
+        let mut unchanged_passes = 0;
+        loop {
+            #[cfg(test)]
+            {
+                self.late_passes_run += 1;
+            }
+            let mut changed = pass == 0;
+            // A property failed in a pass before the last. The error must
+            // still surface from the last pass, as it did when every pass ran.
+            let mut deferred_error = false;
             for prop in &late_inherited_properties {
                 if child_property_names.contains(prop.name.as_ref())
                     || reads_super.contains(prop.name.as_ref())
@@ -3116,6 +3160,7 @@ impl Evaluator {
                 }
                 match self.eval_property(prop, &scope, depth) {
                     Ok(Some(value)) => {
+                        changed = changed || replaces_value(&scope, &prop.name, &value);
                         scope.set(&prop.name, value.clone());
                         module_props_insert(
                             &mut scope,
@@ -3139,7 +3184,10 @@ impl Evaluator {
                     Err(Error::Eval(message))
                         if pass < late_passes
                             || (module_is_abstract(module)
-                                && is_unresolved_template_error(&message)) => {}
+                                && is_unresolved_template_error(&message)) =>
+                    {
+                        deferred_error = true;
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -3159,6 +3207,7 @@ impl Evaluator {
                     Ok(value)
                 }) {
                     Ok(Some(value)) => {
+                        changed = changed || replaces_value(&scope, &prop.name, &value);
                         scope.set(&prop.name, value.clone());
                         if has_modifier(&prop.modifiers, Modifier::Local) {
                             continue;
@@ -3185,9 +3234,24 @@ impl Evaluator {
                     Err(Error::Eval(message))
                         if pass < late_passes
                             || (module_is_abstract(module)
-                                && is_unresolved_template_error(&message)) => {}
+                                && is_unresolved_template_error(&message)) =>
+                    {
+                        deferred_error = true;
+                    }
                     Err(error) => return Err(error),
                 }
+            }
+            if pass == late_passes {
+                break;
+            }
+            unchanged_passes = if changed { 0 } else { unchanged_passes + 1 };
+            if unchanged_passes < settled_after {
+                pass += 1;
+            } else if deferred_error {
+                // Only the last pass reports an error, so run it now.
+                pass = late_passes;
+            } else {
+                break;
             }
         }
 
@@ -10463,5 +10527,130 @@ result = (base) { old = super.old + super.old }
                 .warned_deprecated
                 .contains(&("old".into(), Some("use replacement".into())))
         );
+    }
+}
+
+/// Late-binding passes re-evaluate every inherited property. They must stop
+/// once the values settle, not run once per inherited property.
+#[cfg(all(test, feature = "native-io"))]
+mod late_binding_pass_tests {
+    use super::{Entry, Evaluator, Property, forward_reference_chain};
+
+    /// How many properties the template declares.
+    const PROPERTIES: usize = 60;
+
+    /// A pass per property over `PROPERTIES` properties takes more than
+    /// `PROPERTIES` passes; settling takes a few.
+    const MAX_PASSES: usize = PROPERTIES / 4;
+
+    /// Evaluate `Child.pkl`, which amends `Template.pkl`, and return the
+    /// result with the number of late-binding passes it ran.
+    fn evaluate_amendment(template: &str, child: &str) -> (serde_json::Value, usize) {
+        let dir = std::env::temp_dir().join(format!(
+            "pklr-late-passes-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Template.pkl"), template).unwrap();
+        std::fs::write(dir.join("Child.pkl"), child).unwrap();
+        let mut evaluator = Evaluator::default();
+        let value = evaluator.eval_file(&dir.join("Child.pkl"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        (value.unwrap().to_json(), evaluator.late_passes_run)
+    }
+
+    #[test]
+    fn amending_module_does_not_run_a_pass_per_inherited_property() {
+        // `base`, then `p1 = base + 1`, `p2 = p1 + 1`, and so on.
+        let mut template = String::from("base = 1\n");
+        for n in 1..=PROPERTIES {
+            let previous = if n == 1 {
+                "base".to_string()
+            } else {
+                format!("p{}", n - 1)
+            };
+            template.push_str(&format!("p{n} = {previous} + 1\n"));
+        }
+        let (json, passes) = evaluate_amendment(&template, "amends \"Template.pkl\"\nbase = 10\n");
+
+        assert_eq!(json[format!("p{PROPERTIES}")], 10 + PROPERTIES);
+        assert!(
+            passes <= MAX_PASSES,
+            "{passes} late-binding passes for {PROPERTIES} properties (at most {MAX_PASSES} expected)"
+        );
+    }
+
+    /// `x0 = x1`, `x1 = x2`, and so on to `x{reads} = 1`, with an unrelated
+    /// `w` for the amending module to override, so no value ever changes.
+    fn chain_of_reads(reads: usize) -> String {
+        let mut template = String::new();
+        for n in 0..reads {
+            template.push_str(&format!("x{n} = x{}\n", n + 1));
+        }
+        template.push_str(&format!("x{reads} = 1\nw = 0\n"));
+        template
+    }
+
+    /// Passes that change nothing still run until more of them than the
+    /// longest chain of forward references have passed, and that margin is
+    /// what carries a change through a capture that lags behind. Counted: the
+    /// template's own pass, pass 0 of the amending module, and two quiet
+    /// passes beyond the chain. The amending module lists inherited properties
+    /// twice, so `x0 = x1` and `x1 = x2` in the second copy read the first.
+    #[test]
+    fn quiet_passes_run_past_the_longest_forward_chain() {
+        let child = "amends \"Template.pkl\"\nw = 5\n";
+        let (_, without_reads) = evaluate_amendment(&chain_of_reads(0), child);
+        let (_, with_reads) = evaluate_amendment(&chain_of_reads(4), child);
+        assert_eq!((without_reads, with_reads), (1 + 1 + 2, 1 + 1 + 4));
+    }
+
+    fn longest_chain(source: &str) -> usize {
+        let tokens = crate::lexer::lex(source).unwrap();
+        let module = crate::parser::parse(&tokens).unwrap();
+        let late: Vec<&Property> = module
+            .body
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Property(prop) => Some(&**prop),
+                _ => None,
+            })
+            .collect();
+        forward_reference_chain(&late)
+    }
+
+    #[test]
+    fn properties_declared_after_what_they_read_have_no_forward_chain() {
+        assert_eq!(longest_chain("a = 1\nb = a\nc = b + a\n"), 0);
+    }
+
+    #[test]
+    fn each_read_of_a_later_property_adds_one_to_the_chain() {
+        assert_eq!(longest_chain("c = b\nb = a\na = 1\n"), 2);
+        assert_eq!(longest_chain("c = b\nb = 1\na = 1\n"), 1);
+        assert_eq!(longest_chain("c = a\nb = a\na = 1\n"), 1);
+    }
+
+    #[test]
+    fn a_property_that_reads_the_module_reads_all_the_later_properties() {
+        assert_eq!(longest_chain("m = module\nb = 1\n"), 1);
+        assert_eq!(longest_chain("m = module\nb = a\na = 1\n"), 2);
+        assert_eq!(longest_chain("b = 1\nm = module\n"), 0);
+    }
+
+    #[test]
+    fn a_property_that_reads_a_computed_key_reads_all_the_later_properties() {
+        assert_eq!(longest_chain("m = module[\"B\".toLowerCase()]\nb = 1\n"), 1);
+    }
+
+    #[test]
+    fn properties_that_read_each_other_have_the_longest_possible_chain() {
+        assert_eq!(longest_chain("a = b\nb = a\nc = 1\n"), 3);
+    }
+
+    #[test]
+    fn a_property_that_reads_itself_has_the_longest_possible_chain() {
+        assert_eq!(longest_chain("f = (x) -> f.apply(x)\nb = 1\n"), 2);
     }
 }
